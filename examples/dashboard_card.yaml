@@ -23,6 +23,9 @@ cards:
     content: >-
       {% set owned = is_state('input_boolean.night_ac_bedroom_owned', 'on') %}
       {% set s = states('input_text.night_ac_bedroom_state') | from_json({}) %}
-      **Bedroom:** {{ 'cooling' if owned else ('left alone tonight' if s.released else 'idle') }}
+      {% set s = s if s is mapping else {} %}
+      **Bedroom:** {{ 'probing' if owned and s.get('phase') else ('cooling' if owned else
+        ('left alone tonight' if s.get('released') else
+        ('off' if is_state('input_boolean.night_ac_bedroom', 'off') else 'watching'))) }}
 
       *{{ states('input_text.night_ac_last_action') }}*

@@ -1,7 +1,7 @@
 [project]
 name = "ha-night-time-ac"
-version = "1.0.0"
-description = "Home Assistant blueprint: keep a room under a temperature limit at night, and put the air conditioner back as it was."
+version = "1.1.0"
+description = "Home Assistant blueprint: keep a room under a temperature limit at night, and the air conditioner off (and quiet) the rest of the time."
 requires-python = ">=3.12"
 license = "MIT"
 

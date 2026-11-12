@@ -1,112 +1,120 @@
 # Night time AC
 
 A Home Assistant blueprint that keeps a room at or below a temperature limit
-overnight, and keeps the air conditioner **off** the rest of the time.
+overnight, and keeps its air conditioner **off, and quiet,** the rest of the time.
 
 [![Open your Home Assistant instance and show the blueprint import dialog with this blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/create-link/?redirect=blueprint_import&blueprint_url=https%3A%2F%2Fgithub.com%2Fdavid00769%2Fha-night-time-ac%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fdavid00769%2Fnight_time_ac.yaml)
-
-## Why I built it
-
-Our bedroom air conditioner (a Toshiba SMMS-i VRF indoor unit) runs its fan the
-whole time it is on, even once the room is at its setpoint, and you hear the
-refrigerant moving too. My wife doesn't like the noise, so she turns the AC off
-at night. Then the room warms up, I wake up hot and turn it back on, and the noise
-starts again.
-
-What we wanted was neither "on all night" nor "off all night": **off, and quiet,
-until the room actually gets too hot; then cool it back down and switch off again.**
-A schedule can't do that, and the unit's own thermostat can't either, because it
-keeps the fan running while it waits.
-
-This blueprint does exactly that, and it is careful about whose air conditioner it
-is: it only ever takes over a unit that is off, it puts the unit back the way it
-found it, and when a person changes the unit it hands it back for the rest of the
-night (after one to three minutes, so a passing glitch is not mistaken for a person).
 
 ## What it does
 
 During the hours you set, for each room you switch on:
 
-1. If the room has been **above the limit** (plus a small margin) for a few minutes,
-   with its windows closed, it turns the air conditioner on in **cool** at the limit.
-2. When the room is **back at the limit**, or the unit has **stopped cooling** for a
-   while (it reports idle or fan, or its own reading has reached its setpoint), or the
-   night ends, it turns the unit **off** and puts its setpoint back to what it was
-   (when the unit reported one).
-3. It waits a while before starting again, so it doesn't cycle the compressor.
+1. If the room has been **above your limit** (plus a small margin) for a few minutes,
+   with its windows closed, it turns the air conditioner on in **cool**.
+2. When the room is **back at the limit**, or the unit has **stopped cooling**, or the
+   night ends, it switches the unit **off** and puts its earlier temperature setting
+   back.
+3. It waits a while before starting again, so it doesn't keep cycling.
 
-It never heats (it only ever uses `cool`), never changes the fan, and never stops a
-unit it didn't start.
+It only cools, never heats. It only takes over a unit that is off, and it hands a unit
+back to you as soon as you change it.
+
+## Why I built it
+
+Our bedroom air conditioner is a ducted Toshiba unit (an SMMS-i VRF system: one
+outdoor unit serving several rooms). Even once the room reaches its setpoint (the
+temperature the unit is set to), it keeps its fan running and you can hear the
+refrigerant moving. My wife doesn't like the noise, so she turns the AC off at night.
+Then the room warms up, I wake up hot, I turn it back on, and the noise starts again.
+
+We wanted neither "on all night" nor "off all night", but **off and quiet until the
+room is actually too hot, then cool it and switch off again.** A schedule can't do
+that, and the unit's own thermostat can't either, because it keeps the fan running
+while it waits.
 
 ## The rules
 
 | Situation | What it does |
 | --- | --- |
-| Unit off, room over the limit for the hold time, windows closed | Starts it: `cool`, at the limit rounded down to the unit's own step |
+| Unit off, room over the limit for the hold time, windows closed | Starts it in `cool`, at the limit rounded down to the unit's own setting step |
 | Unit already on, in any mode, at any setting | Leaves it alone |
-| Room back at the limit | Off, then the earlier setpoint is restored |
-| Unit it started has stopped cooling for the idle time | Off, so the room is quiet; starts again if the room warms |
-| End of the hours, master switch off, or this room's switch off | Off, setpoint restored |
+| Room back at the limit | Switches off, then restores the earlier setting |
+| A unit it started has stopped cooling for the idle time | Switches off, so the room is quiet; starts again if the room warms |
+| End of the hours, master switch off, or this room's switch off | Switches off and restores the earlier setting |
 | Limit changed | Updates only units it started |
-| Someone changes a unit it started | Hands it back and leaves it alone until the night ends or the room's switch goes off. A changed setpoint or fan counts after 90 seconds, another mode after 1 minute, off after 3 minutes |
+| Someone changes a unit it started | Hands it back until the night ends or the room's switch goes off. A changed setpoint or fan counts after 90 seconds, another mode after 1 minute, off after 3 minutes |
 | A window stays open | Won't start; a running unit is switched off |
-| Another automation's flag is not off ("Leave alone while") | Won't start |
-| Room sensor offline | Won't start; a running unit carries on until another stop applies |
+| "Leave alone while" entity not off | Won't start |
+| Room sensor offline, probing off | Won't start; a running unit carries on until another stop applies |
+| Room has no reading, probing on | Probes it (below) |
 | Unit offline, or a command not confirmed | Keeps it and retries from what the unit reports |
-| Home Assistant restarts cleanly | Carries on from the stored state |
 | Unit has no `cool` mode | Never started |
+| Home Assistant restarts cleanly | Carries on from where it was |
+
+## Probing a room with no reading (optional)
+
+If a room has no room sensor, or its sensor is offline, the blueprint can **probe** it.
+It runs the unit's fan for a few minutes and then reads the unit's own sensor. An idle
+unit measures the air inside itself, but once air is moving its reading follows the
+room.
+
+- **When:** only during your hours, when nothing else would stop a start, and at most
+  every *Probe every* minutes.
+- **What happens:** it switches the unit to **fan only**. Once the unit reports it is
+  running, it notes the fan setting and turns the fan down to the probe speed (`low` by
+  default). Then it waits *Probe length* minutes.
+- **Too hot:** if the reading is at or above the limit plus the margin, it goes
+  straight to cooling. The fan stays on the quiet speed and is put back before the
+  unit switches off.
+- **Fine:** otherwise it puts the fan back while the unit is still running, confirms
+  it, and switches off.
+- **Interrupted:** a person switching the unit to another mode gets it, as usual, with
+  the fan still at the probe speed. If someone switches it off (an off reading has to
+  hold for 2 minutes to count), the room is left alone until the next night. The fan is
+  then left at the probe speed, because setting the fan on an off unit can switch it
+  back on.
+- **Commands that don't land** are resent. A probe that never starts is sent `off` after
+  5 minutes, a fan that won't go back is given 3 minutes, and if cooling isn't confirmed
+  within 5 minutes the probe winds down to off. When in doubt, it ends with the unit off.
+
+Measured on a ducted unit on low fan: the reading was 1 °C off the room until about
+150 seconds, then matched. So the default probe length is 3 minutes, and the reading is
+only used at the end, because an idle unit can read either high or low. Each probe is a
+few minutes of fan noise, so it is off by default. A room sensor is better; probing is
+the backup.
 
 ## Setup
 
 ### 1. Create the helpers
 
-A blueprint can't remember anything by itself, so each room needs a small state
-store, and the rooms share a few settings. The easiest way is a package
-(`configuration.yaml`: `homeassistant: packages: !include_dir_named packages`),
-using [`examples/night_time_ac_helpers.yaml`](examples/night_time_ac_helpers.yaml):
+A blueprint can't remember anything by itself. So each room needs three helpers, and
+all rooms share four (five with the optional last-action text).
 
-```yaml
-input_boolean:
-  night_ac:                 # master switch, shared
-    name: Night time AC
-    icon: mdi:weather-night
-  night_ac_bedroom:         # this room on/off
-    name: Night time AC - Bedroom
-  night_ac_bedroom_owned:   # used only by the automation
-    name: Night time AC - Bedroom owned
+**As a package (YAML).**
+1. In `configuration.yaml`, add:
+   ```yaml
+   homeassistant:
+     packages: !include_dir_named packages
+   ```
+2. Copy [`examples/night_time_ac_helpers.yaml`](examples/night_time_ac_helpers.yaml)
+   to `/config/packages/`, and repeat its three per-room helpers for each room.
+3. Restart Home Assistant.
 
-input_number:
-  night_ac_limit:           # shared, in Home Assistant's temperature unit
-    name: Night time AC limit
-    min: 18                 # °F: 64
-    max: 28                 # °F: 82
-    step: 0.5               # °F: 1
-    unit_of_measurement: °C # °F: °F
+**Or in the UI:** **Settings > Devices & services > Helpers > Create helper**.
 
-input_datetime:
-  night_ac_start:
-    name: Night time AC start
-    has_time: true
-  night_ac_end:
-    name: Night time AC end
-    has_time: true
+| Helper | Type in the UI | Settings |
+| --- | --- | --- |
+| Night time AC | Toggle | Shared master switch |
+| Night time AC limit | Number | Shared. Min 18, max 28, step 0.5, unit °C (Fahrenheit: 64, 82, 1, °F) |
+| Night time AC start, Night time AC end | Date and/or time | Shared. **Time** only |
+| Night time AC last action (optional) | Text | Shared. Max length 255 |
+| Night time AC - Bedroom | Toggle | This room on or off |
+| Night time AC - Bedroom owned | Toggle | Used only by the automation; leave it alone |
+| Night time AC - Bedroom state | Text | Used only by the automation. **Max length 255** |
 
-input_text:
-  night_ac_bedroom_state:   # used only by the automation
-    name: Night time AC - Bedroom state
-    max: 255                # required: the default of 100 is too short
-  night_ac_last_action:     # optional, shared: what happened last, for the card
-    name: Night time AC last action
-    max: 255
-```
-
-Or create the same helpers in **Settings > Devices & services > Helpers**. The
-state text needs **Maximum length 255**; the automation does nothing until it has.
-Set the limit and the start and end times once created (for example 22 °C,
-21:00 and 07:00).
-
-Repeat the three per-room helpers (`night_ac_<room>`, `night_ac_<room>_owned`,
-`night_ac_<room>_state`) for each room.
+New helpers start at their minimum: a limit of 18 °C, and start and end both at
+00:00, which means "no hours" so nothing runs. Set the limit and the hours, for
+example 22 °C, 21:00 and 07:00.
 
 ### 2. Import the blueprint
 
@@ -116,79 +124,100 @@ blueprint** with
 
 ### 3. Create one automation per room
 
-**Create automation > Night time AC**, then pick the room's air conditioner, a
-temperature sensor **in the room**, its window contacts, and the helpers. Rooms on
-one outdoor unit: give each a different **Second of each minute to check** (0, 20,
-40) so they don't start together.
+**Create automation > Night time AC**, then choose the room's air conditioner, a
+temperature sensor **in the room**, its window contacts, and the helpers.
+
+If several rooms share one outdoor unit (a multi-split or VRF system), give each room a
+different **Second of each minute to check** so they don't start together: 0, 20, 40 for
+three rooms, or 0, 12, 24, 36, 48 for five.
 
 ### 4. Add a card
 
-[`examples/dashboard_card.yaml`](examples/dashboard_card.yaml) is a tile for the
-master switch, the limit and hours, and a switch per room.
+[`examples/dashboard_card.yaml`](examples/dashboard_card.yaml): a tile for the master
+switch, the limit and hours, a switch per room, and a status line.
 
 ## Inputs
 
+The names are as the automation editor shows them.
+
 | Input | Required | Notes |
 | --- | --- | --- |
-| Air conditioner | yes | Any `climate` entity that supports `cool` |
-| Room temperature sensor | for it to start | A sensor in the room. Empty: the room never starts |
+| Air conditioner | yes | A `climate` entity that offers `cool` |
+| Room temperature sensor | for it to start | A sensor with the temperature device class. Empty: the room only starts through probing |
 | Windows and doors | no | `binary_sensor`s that are on when open |
-| This room's switch | yes | `input_boolean` |
-| This room's owned flag | yes | `input_boolean`, used only by this automation |
-| This room's state store | yes | `input_text`, maximum length 255, used only by this automation |
-| Master switch | yes | `input_boolean`, shared |
-| Temperature limit | yes | `input_number`, shared, in Home Assistant's temperature unit |
-| Start time, End time | yes | `input_datetime`, time only, shared. Equal means no hours |
-| Margin | no | Default 0.5 above the limit before starting; at least 0.2, so it cannot start and stop around the limit |
+| This room's switch | yes | Toggle |
+| This room's owned flag | yes | Toggle, used only by this automation |
+| This room's state store | yes | Text, max length 255, used only by this automation |
+| Master switch | yes | Toggle, shared |
+| Temperature limit | yes | Number, shared, in Home Assistant's temperature unit |
+| Start time, End time | yes | Date and/or time, time only, shared. Equal start and end: never runs |
+| Margin above the limit before starting | no | Default 0.5, at least 0.2, in the limit's unit (Fahrenheit: use 1) |
 | Minutes over the limit before starting | no | Default 5 |
 | Minutes off before starting again | no | Default 15 |
-| Minutes idle before switching off | no | Default 10; 0 keeps a started unit on until the room or night ends |
-| Window minutes (open to stop, closed to start) | no | Default 2 and 5 |
+| Minutes idle before switching a running unit off | no | Default 10; 0 keeps it on until the room or the night ends |
+| Probe a room with no reading every (minutes) | no | Default 0 (off) |
+| Probe length (minutes) | no | Default 3 |
+| Probe fan speed | no | Default `low` |
+| Minutes a window stays open before a running unit stops | no | Default 2 |
+| Minutes every window must be closed before starting | no | Default 5 |
 | Second of each minute to check | no | Default 0 |
-| Leave alone while | no | Entities that must all be **off** for a start; unavailable counts as not off |
-| Last action text, battery and grid sensors | no | Only for the log |
+| Leave alone while | no | Entities that must all be off for a start; unavailable counts as not off |
+| Last action text | no | Text helper for the card |
+| Battery level sensor, Grid power sensor | no | Only added to the log |
 
 ## Things learned on real hardware
 
-- **Use a sensor in the room, not the air conditioner's reading.** An idle ducted
-  unit measures air at the unit, not in the room. Ours read about 14 °C overnight
-  with the room at 20-22 °C, then matched the room within two minutes of the fan
-  starting. So the room sensor decides when to start and stop; the unit's reading
-  is only used, while it is running, to tell whether it has stopped cooling.
-- **Put the setpoint back after switching off, not before.** A setpoint sent just
-  before `off` was lost; one sent to a unit that was already off landed within
-  seconds and left it off. The automation does it in that order and checks it.
-- **Judge a manual change on what the unit reports, and give it time.** Readings lag
-  commands and can drop out for a minute, so a change only counts when it holds, and
-  a missing reading never counts as one.
+- **Use a sensor in the room, not the air conditioner's reading.** An idle ducted unit
+  measures the air inside itself. Ours read about 14 °C overnight with the room at
+  20-22 °C, and another read 1 °C above its room. Both matched within a few minutes of
+  the fan starting. So the room sensor decides when to start and stop, and the unit's
+  reading is only used while air is moving.
+- **Put the setpoint back after switching off; put the fan back before.** A setpoint
+  sent just before `off` was lost, but one sent to an off unit landed within seconds.
+  The fan is the other way round: one sent to an off unit may switch it back on. The
+  automation does both in the safe order, and checks them.
+- **Judge a manual change by what the unit reports, and give it time.** Readings lag
+  commands and can drop out for a minute, so a change only counts once it holds, and a
+  missing reading never counts as one.
 - **Keep "I started this" in its own helper.** If the state store is wiped or a write
   to it fails, a unit this automation started must still be switched off rather than
-  left cooling all night, so each room has an owned flag as well as the state store.
+  left cooling all night. So each room has an owned flag as well as the state store.
 
 ## Working with other automations
 
 If something else may also run the same air conditioner (a solar-surplus routine,
 say), put its "I own this unit" flag in **Leave alone while**. This automation then
-won't start the unit while that flag is on or not yet loaded, and it never stops a
-unit it didn't start.
+won't start the unit while that flag is on or not yet loaded, and it never stops a unit
+it didn't start.
 
 ## Limitations
 
-- One air conditioner per automation; one room sensor per room.
-- It checks once a minute, so starts and stops are a minute or so behind.
-- It doesn't run the fan, change modes other than `cool`, or pre-cool.
+- One `climate` entity per automation. A zoned ducted system with one entity for several
+  rooms needs one automation, with one room sensor.
+- **Integrations that can't see the unit.** IR-blaster integrations (SmartIR, Broadlink)
+  only assume a state, so a person using the remote is never noticed. Some cloud
+  integrations switch a unit on when sent a setpoint, which can briefly restart it as
+  the setting is restored. Test a cycle with your integration before relying on it.
+- It checks once a minute, so starts and stops lag by about a minute.
 - If the unit's own thermostat is satisfied before the room sensor reaches the limit,
-  the idle stop switches it off and it starts again if the room stays over. On a hot
+  the idle stop switches it off, and it starts again if the room stays over. On a hot
   night that can mean a few short runs instead of one long one: each at least the idle
-  time on and the cooldown plus hold time off (by default 10 on, 20 off).
+  time on, and the cooldown plus hold time off (by default 10 minutes on, 20 off).
 - After a power cut or crash, Home Assistant restores helpers as they were last saved
-  (every 15 minutes and at shutdown). A unit started in the last few minutes before
-  the cut can come back looking like someone else's and be left running. A clean
+  (every 15 minutes, and at shutdown). A unit started in the last few minutes before
+  the cut can come back looking like someone else's, and be left running. A clean
   restart is fine.
-- If an integration reports a unit as `off` for three minutes during a fault and it
-  then comes back cooling, it has already been handed back and is left running.
+- If an integration reports a unit as `off` for three minutes during a fault, and the
+  unit then comes back cooling, it has already been handed back and is left running.
 - A released room is freed when the night ends or its own switch goes off, not when
   the master switch goes off.
+- A person changing the fan during a probe, or in the 3 minutes while the fan is being
+  put back, has it put back.
+- After a restart, a room sensor that hasn't reported yet counts as no reading, so the
+  room may be probed once.
+- With *Minutes idle before switching a running unit off* set to 0, a room cooled after a
+  probe has no room reading to stop on, so it cools until the night ends. Keep the idle
+  stop on if you probe.
 - Blueprints have no version number; see [CHANGELOG.md](CHANGELOG.md). Re-importing
   replaces the file under every automation that uses it.
 
@@ -198,9 +227,9 @@ unit it didn't start.
 uv run --group dev pytest
 ```
 
-The tests render the blueprint's own templates against a stub of Home
-Assistant's template functions. They are not Home Assistant, so a change is also
-checked on a real instance before release.
+The tests render the blueprint's own templates against a stand-in for Home Assistant's
+template functions. They are not Home Assistant, so every release is also checked on a
+real instance.
 
 ## License
 

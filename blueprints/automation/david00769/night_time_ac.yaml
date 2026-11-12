@@ -1,12 +1,11 @@
 blueprint:
   name: Night time AC
   description: >-
-    Keeps one room at or below a temperature limit during set hours. If the room
-    goes over the limit, its air conditioner cools it back to the limit and then
-    returns to off with its earlier setpoint. A unit that someone else turned on
-    is never touched, whatever its setting, and a manual change to a unit this
-    automation started hands it back for the rest of the night. Create one
-    automation per room.
+    Keeps one room at or below a temperature limit during set hours, and its air
+    conditioner off (and quiet) the rest of the time. If the room goes over the
+    limit, the unit cools it back down, then switches off with its earlier setting.
+    A unit someone else turned on is never touched, and a person changing a unit it
+    started gets it back for the rest of the night. Create one automation per room.
 
     Needs, per room: an on/off switch (input_boolean), an "owned" flag
     (input_boolean) and a state store (input_text with maximum length 255). Shared
@@ -30,9 +29,11 @@ blueprint:
         room_temperature:
           name: Room temperature sensor
           description: >-
-            A sensor in the room. The air conditioner's own reading is not used:
-            an idle ducted unit can read far below the room. Leave empty and the
-            room never starts.
+            A temperature sensor in the room (only sensors with the temperature
+            device class are listed). The air conditioner's own reading is not used
+            for this: an idle unit measures the air inside itself, which can be
+            degrees away from the room. Leave empty only if you turn on probing
+            (Tuning); otherwise the room never starts.
           default: ""
           selector:
             entity:
@@ -72,7 +73,11 @@ blueprint:
                 domain: input_boolean
         state:
           name: This room's state store
-          description: An input_text only this automation uses. Set its maximum length to 255.
+          description: >-
+            An input_text only this automation uses. Its maximum length must be 255
+            (the default of 100 is too short). If the automation never does anything,
+            open its trace: a failed first condition means a helper is missing, not yet
+            loaded, or this length is too short.
           selector:
             entity:
               filter:
@@ -111,13 +116,16 @@ blueprint:
       input:
         margin:
           name: Margin above the limit before starting
-          description: Keeps it from starting and stopping around the limit, so not below 0.2.
+          description: >-
+            In the limit's unit. Keeps it from starting and stopping around the limit,
+            so not below 0.2. On Fahrenheit, 1 is a good value.
           default: 0.5
           selector:
             number:
               min: 0.2
               max: 3
               step: 0.1
+              unit_of_measurement: "°"
         hold_minutes:
           name: Minutes over the limit before starting
           default: 5
@@ -148,6 +156,35 @@ blueprint:
               min: 0
               max: 60
               unit_of_measurement: min
+        probe_every_minutes:
+          name: Probe a room with no reading every (minutes)
+          description: >-
+            For a room without a working room sensor: run the unit's fan for a few
+            minutes and read its own sensor, which follows the room once air moves. If
+            the room is over the limit it starts cooling; otherwise the fan goes back as
+            it was and the unit off. 0 turns probing off. Each probe is a few minutes of
+            fan noise.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 120
+              unit_of_measurement: min
+        probe_minutes:
+          name: Probe length (minutes)
+          description: How long the fan runs before the reading is trusted. A ducted unit on low fan needed about 2.5.
+          default: 3
+          selector:
+            number:
+              min: 1
+              max: 10
+              unit_of_measurement: min
+        probe_fan:
+          name: Probe fan speed
+          description: The quietest speed the unit offers. Left as it is if the unit does not offer it.
+          default: low
+          selector:
+            text:
         window_open_minutes:
           name: Minutes a window stays open before a running unit stops
           default: 2
@@ -227,6 +264,9 @@ variables:
   hold_minutes: !input hold_minutes
   cooldown_minutes: !input cooldown_minutes
   idle_stop_minutes: !input idle_stop_minutes
+  probe_every_minutes: !input probe_every_minutes
+  probe_minutes: !input probe_minutes
+  probe_fan: !input probe_fan
   window_open_minutes: !input window_open_minutes
   window_closed_minutes: !input window_closed_minutes
   skip_input: !input skip_while
@@ -292,17 +332,90 @@ actions:
         {%- for window in windows -%}
           {#- A removed sensor reads as None here; it blocks a start and must not raise. -#}
           {%- set contact = states[window] -%}
-          {%- set held = (now() - contact.last_changed).total_seconds() if contact is not none else 0 -%}
-          {%- if is_state(window, 'on') and held >= window_open_minutes * 60 %}{% set ns.held_open = true %}{% endif -%}
-          {%- if not is_state(window, 'off') or held < window_closed_minutes * 60 %}{% set ns.not_settled_closed = true %}{% endif -%}
+          {%- set contact_held = (now() - contact.last_changed).total_seconds() if contact is not none else 0 -%}
+          {%- if is_state(window, 'on') and contact_held >= window_open_minutes * 60 %}{% set ns.held_open = true %}{% endif -%}
+          {%- if not is_state(window, 'off') or contact_held < window_closed_minutes * 60 %}{% set ns.not_settled_closed = true %}{% endif -%}
         {%- endfor -%}
         {%- if is_state(owned_flag, 'on') -%}
           {%- set age = clock - (s.get('commanded_at') or 0) -%}
           {%- set wants_stop = not allowed or ns.held_open or (room is not none and room <= limit) -%}
           {%- set setpoint = state_attr(climate_entity, 'temperature') | float(-999) -%}
           {%- set fan = state_attr(climate_entity, 'fan_mode') -%}
+          {%- set fan_modes = state_attr(climate_entity, 'fan_modes') or [] -%}
+          {#- Set by a probe that went on to cool: put the fan back while running, before off,
+              for up to three minutes. -#}
+          {%- set fan_back = mode != 'off' and s.get('fan') is not none and s.get('fan') in fan_modes and
+              fan not in [none, '', 'unknown', 'unavailable'] and fan != s.get('fan') and
+              clock - (s.get('fan_sent') if s.get('fan_sent') is not none else clock) < 180 -%}
           {%- if mode in ['unknown', 'unavailable', 'none', ''] -%}
             hold
+          {%- elif s.get('phase') -%}
+            {#- A probe: fan only, read the unit at the end, put the fan back while it runs,
+                then off. The fan is never set on an off unit, every wait has a limit, and when
+                in doubt the unit ends off, never handed back running. -#}
+            {%- set phase = s.get('phase') -%}
+            {%- set fan_done = s.get('fan') is none or s.get('fan') not in fan_modes or fan == s.get('fan') or
+                clock - (s.get('fan_sent') or clock) >= 180 -%}
+            {%- if mode not in ['fan_only', 'off', 'cool'] or (mode == 'cool' and not s.get('hot_at')) -%}
+              {#- Only a person puts a probing unit in another mode. -#}
+              {{ 'release' if held >= 60 else 'hold' }}
+            {%- elif phase == 'probe' -%}
+              {%- if not s.get('on_at') and (not allowed or ns.held_open) -%}
+                probe_off
+              {%- elif mode == 'off' -%}
+                {%- if s.get('on_at') -%}
+                  {#- Switched off once running: a person, so leave the room alone tonight. -#}
+                  {{ 'probe_released' if held >= 120 else 'hold' }}
+                {%- elif clock - (s.get('last_probe_at') or 0) >= 300 -%}
+                  probe_off
+                {%- else -%}
+                  {{ 'probe_resend' if age >= 60 else 'hold' }}
+                {%- endif -%}
+              {%- elif not s.get('on_at') -%}
+                probe_running
+              {%- elif not allowed or ns.held_open -%}
+                probe_restore
+              {%- elif clock - s.get('on_at') >= probe_minutes * 60 -%}
+                {%- set reading = state_attr(climate_entity, 'current_temperature') | float(none) -%}
+                {{ 'probe_hot' if reading is not none and reading >= limit + margin else 'probe_restore' }}
+              {%- else -%}
+                hold
+              {%- endif -%}
+            {%- elif phase == 'probe_cool' -%}
+              {%- if mode == 'cool' -%}
+                probe_cool_ok
+              {%- elif mode == 'off' -%}
+                {#- A person's off; made sure off anyway, so a late cool cannot run on unowned. -#}
+                {{ 'probe_off_released' if held >= 120 else 'hold' }}
+              {%- elif not allowed or ns.held_open or clock - (s.get('hot_at') or clock) >= 300 -%}
+                probe_restore
+              {%- else -%}
+                {{ 'probe_hot' if age >= 60 else 'hold' }}
+              {%- endif -%}
+            {%- elif mode == 'cool' -%}
+              {#- A cool sent after a hot probe that landed late: ours, so off. -#}
+              probe_off
+            {%- elif phase == 'probe_restore' -%}
+              {%- if mode == 'off' -%}
+                {{ ('probe_released' if not s.get('hot_at') else 'probe_off_released') if held >= 120 else 'hold' }}
+              {%- elif fan_done -%}
+                probe_off
+              {%- else -%}
+                {{ 'probe_restore' if age >= 60 else 'hold' }}
+              {%- endif -%}
+            {%- else -%}
+              {{ 'probe_finish' if mode == 'off' else ('probe_off' if age >= 60 else 'hold') }}
+            {%- endif -%}
+          {%- elif s.get('expected') is none -%}
+            {#- The saved state is gone, so there is nothing to run to: make sure it is off,
+                resending until it is. Heat or dry it never sets, so those are a person's. -#}
+            {%- if mode not in ['cool', 'fan_only', 'off'] -%}
+              {{ 'release' if held >= 60 else 'hold' }}
+            {%- elif mode == 'off' -%}
+              finish
+            {%- else -%}
+              {{ 'stop' if not s.get('stopping') or age >= 120 else 'hold' }}
+            {%- endif -%}
           {%- elif mode not in ['cool', 'off'] -%}
             {#- This automation only ever sets cool, so another mode held a minute is a person's
                 choice; a passing one while the unit changes state is not. -#}
@@ -316,19 +429,20 @@ actions:
             {%- else -%}
               finish
             {%- endif -%}
-          {%- elif s.get('expected') is none -%}
-            {#- The saved state is gone: there is nothing to run to, so never command it on. -#}
-            stop
           {%- elif not s.get('settled') -%}
-            {{ 'stop' if wants_stop else
+            {{ ('restore_fan' if fan_back else 'stop') if wants_stop else
                ('settle' if mode == 'cool' and (setpoint - s.get('expected') | float(-1)) | abs < tol else
                 ('resend' if age >= 120 else 'hold')) }}
+          {%- elif s.get('fan_sent') and fan == s.get('fan') -%}
+            {#- Our fan setting landed: it is the baseline again, so a person's change counts. -#}
+            fan_restored
           {%- elif mode == 'off' -%}
             {#- Off could be one bad reading or a person: judge it for three minutes and do
                 nothing meanwhile, so a person's off becomes a release and not a stop. -#}
             {{ 'release' if held >= 180 else 'hold' }}
           {%- elif (setpoint != -999 and (setpoint - s.get('expected') | float(-1)) | abs >= tol) or
-                   (fan not in [none, '', 'unknown', 'unavailable'] and s.get('running_fan') is not none and fan != s.get('running_fan')) -%}
+                   (fan not in [none, '', 'unknown', 'unavailable'] and s.get('running_fan') is not none and fan != s.get('running_fan') and
+                    not (s.get('fan_sent') and clock - s.get('fan_sent') < 180)) -%}
             {#- A missing reading is not a change. A differing one must hold 90 seconds from when
                 it was first seen; nothing else is decided meanwhile, so a person's change is not undone. -#}
             {%- if not s.get('changed_since') -%}
@@ -339,7 +453,7 @@ actions:
               hold
             {%- endif -%}
           {%- elif wants_stop -%}
-            stop
+            {{ 'restore_fan' if fan_back else 'stop' }}
           {%- elif s.get('changed_since') -%}
             clear_change
           {%- elif (s.get('expected') | float(-1) - target) | abs >= tol -%}
@@ -356,7 +470,7 @@ actions:
             {%- if idle and not s.get('idle_since') -%}
               mark_idle
             {%- elif idle and clock - s.get('idle_since') >= idle_stop_minutes * 60 -%}
-              stop
+              {{ 'restore_fan' if fan_back else 'stop' }}
             {%- elif not idle and s.get('idle_since') -%}
               clear_idle
             {%- else -%}
@@ -371,15 +485,20 @@ actions:
           {%- set can_cool = 'cool' in (state_attr(climate_entity, 'hvac_modes') or []) -%}
           {%- set can_start = allowed and mode == 'off' and can_cool and others_clear and cooled_down and
               not ns.not_settled_closed and room is not none and room >= limit + margin -%}
+          {%- set can_probe = room is none and probe_every_minutes > 0 and allowed and mode == 'off' and can_cool and
+              'fan_only' in (state_attr(climate_entity, 'hvac_modes') or []) and others_clear and cooled_down and
+              not ns.not_settled_closed and clock - (s.get('last_probe_at') or 0) >= probe_every_minutes * 60 -%}
           {%- if can_start -%}
             {{ 'mark_over' if not s.get('over_since') else
                ('start' if clock - s.get('over_since') >= hold_minutes * 60 else 'hold') }}
+          {%- elif can_probe -%}
+            probe
           {%- else -%}
             {{ 'clear_over' if s.get('over_since') else 'hold' }}
           {%- endif -%}
         {%- endif -%}
       saved: "{{ (states(state_store) | from_json({})) if (states(state_store) | from_json({})) is mapping else {} }}"
-      stamp: "{{ now().timestamp() | round(0) }}"
+      stamp: "{{ now().timestamp() | int }}"
       energy: >-
         {%- set parts = [] -%}
         {%- if battery_level %}{% set parts = parts + ['battery ' ~ states(battery_level) ~ '%'] %}{% endif -%}
@@ -474,8 +593,8 @@ actions:
             data:
               hvac_mode: "off"
       # After off: a setpoint sent just before off was lost on a real unit, while one
-      # sent to an off unit landed within seconds and left it off. The fan needs no
-      # restoring because this automation never changes it.
+      # sent to an off unit landed within seconds and left it off. A fan changed by a
+      # probe is put back before off instead (restore_fan).
       - conditions: "{{ decision == 'restore_setpoint' }}"
         sequence:
           - action: climate.set_temperature
@@ -492,7 +611,8 @@ actions:
             target:
               entity_id: "{{ state_store }}"
             data:
-              value: "{{ {'stopped_at': stamp} | to_json }}"
+              value: >-
+                {{ dict({'stopped_at': stamp}, **({'last_probe_at': saved.get('last_probe_at')} if saved.get('last_probe_at') else {})) | to_json }}
           - action: logbook.log
             data:
               name: Night time AC
@@ -541,6 +661,202 @@ actions:
               entity_id: "{{ state_store }}"
             data:
               value: "{{ dict(saved, over_since=stamp) | to_json }}"
+      - conditions: "{{ decision == 'probe' }}"
+        sequence:
+          # Save first, so a failure part-way can still be put back.
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: >-
+                {{ {'phase': 'probe', 'temperature': state_attr(climate_entity, 'temperature'),
+                    'commanded_at': stamp, 'last_probe_at': stamp} | to_json }}
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ owned_flag }}"
+          # Fan only, and nothing else yet: a fan setting sent to an off unit may switch it on
+          # in whatever mode it was last left in.
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: fan_only
+          - action: logbook.log
+            data:
+              name: Night time AC
+              entity_id: "{{ climate_entity }}"
+              message: "{{ room_name }} has no room reading: running the fan for {{ probe_minutes }} minutes to read it."
+      - conditions: "{{ decision == 'probe_resend' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, commanded_at=stamp) | to_json }}"
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: fan_only
+      - conditions: "{{ decision == 'probe_running' }}"
+        sequence:
+          # Running now: note its fan to put back, then the quiet speed.
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, on_at=stamp, fan=state_attr(climate_entity, 'fan_mode')) | to_json }}"
+          - if: >-
+              {{ probe_fan in (state_attr(climate_entity, 'fan_modes') or []) and
+                 state_attr(climate_entity, 'fan_mode') != probe_fan }}
+            then:
+              - action: climate.set_fan_mode
+                target:
+                  entity_id: "{{ climate_entity }}"
+                data:
+                  fan_mode: "{{ probe_fan }}"
+      - conditions: "{{ decision == 'probe_hot' }}"
+        sequence:
+          # Over the limit: cool now. The phase stays until cool is confirmed, so a dropped
+          # command is resent rather than mistaken for a person.
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: >-
+                {{ dict(saved, phase='probe_cool', hot_at=saved.get('hot_at') or stamp, expected=target,
+                        commanded_at=stamp, settled=false) | to_json }}
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: cool
+          - action: climate.set_temperature
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              temperature: "{{ target }}"
+          - if: "{{ not saved.get('hot_at') }}"
+            then:
+              - action: logbook.log
+                data:
+                  name: Night time AC
+                  entity_id: "{{ climate_entity }}"
+                  message: "{{ room_name }} read {{ state_attr(climate_entity, 'current_temperature') }} after the fan ran: cooling to {{ target }}{{ energy }}."
+              - if: "{{ last_action != '' }}"
+                then:
+                  - action: input_text.set_value
+                    target:
+                      entity_id: "{{ last_action }}"
+                    data:
+                      value: "{{ room_name }} over the limit (fan reading): cooling to {{ target }}{{ energy }}."
+      - conditions: "{{ decision == 'probe_cool_ok' }}"
+        sequence:
+          # Cooling confirmed: from here it is an ordinary start, with the fan to put back.
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: >-
+                {{ {'temperature': saved.get('temperature'), 'fan': saved.get('fan'), 'expected': saved.get('expected'),
+                    'commanded_at': saved.get('commanded_at'), 'settled': false,
+                    'last_probe_at': saved.get('last_probe_at')} | to_json }}
+      - conditions: "{{ decision == 'probe_restore' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: >-
+                {{ dict(saved, phase='probe_restore', commanded_at=stamp, fan_sent=saved.get('fan_sent') or stamp) | to_json }}
+          - if: >-
+              {{ saved.get('fan') in (state_attr(climate_entity, 'fan_modes') or []) and
+                 state_attr(climate_entity, 'fan_mode') != saved.get('fan') and states(climate_entity) != 'off' }}
+            then:
+              - action: climate.set_fan_mode
+                target:
+                  entity_id: "{{ climate_entity }}"
+                data:
+                  fan_mode: "{{ saved.get('fan') }}"
+      - conditions: "{{ decision == 'probe_off' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, phase='probe_stopping', commanded_at=stamp) | to_json }}"
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: "off"
+      - conditions: "{{ decision == 'probe_off_released' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, phase='probe_stopping', commanded_at=stamp, release_after=true) | to_json }}"
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: "off"
+      - conditions: "{{ decision == 'probe_finish' }}"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ owned_flag }}"
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: >-
+                {{ (dict({'released': true}, last_probe_at=saved.get('last_probe_at')) if saved.get('release_after')
+                    else {'last_probe_at': saved.get('last_probe_at')}) | to_json }}
+          - action: logbook.log
+            data:
+              name: Night time AC
+              entity_id: "{{ climate_entity }}"
+              message: >-
+                {{ room_name }} probe done (unit read {{ state_attr(climate_entity, 'current_temperature') }});
+                {{ 'off, fan as it was.' if saved.get('phase') == 'probe_stopping' else 'switched off by someone during the probe.' }}
+      - conditions: "{{ decision == 'fan_restored' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, running_fan=saved.get('fan'), fan_sent=0) | to_json }}"
+      - conditions: "{{ decision == 'probe_released' }}"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ owned_flag }}"
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ {'released': true, 'last_probe_at': saved.get('last_probe_at')} | to_json }}"
+          - action: logbook.log
+            data:
+              name: Night time AC
+              entity_id: "{{ climate_entity }}"
+              message: "{{ room_name }} switched off during a probe: left alone until the next night."
+      - conditions: "{{ decision == 'restore_fan' }}"
+        sequence:
+          # The baseline is not rewritten: until this lands, the old speed is still not a
+          # person's change, and it is resent for up to three minutes, then the unit stops.
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, fan_sent=saved.get('fan_sent') or stamp) | to_json }}"
+          - action: climate.set_fan_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              fan_mode: "{{ saved.get('fan') }}"
       - conditions: "{{ decision == 'mark_change' }}"
         sequence:
           - action: input_text.set_value
@@ -576,4 +892,7 @@ actions:
               entity_id: "{{ state_store }}"
             data:
               value: >-
-                {{ ({'stopped_at': saved.get('stopped_at')} if saved.get('stopped_at') else {}) | to_json }}
+                {%- set keep = {} -%}
+                {%- if saved.get('stopped_at') %}{% set keep = dict(keep, stopped_at=saved.get('stopped_at')) %}{% endif -%}
+                {%- if saved.get('last_probe_at') %}{% set keep = dict(keep, last_probe_at=saved.get('last_probe_at')) %}{% endif -%}
+                {{ keep | to_json }}

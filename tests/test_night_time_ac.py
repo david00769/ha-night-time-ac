@@ -55,6 +55,9 @@ ROOM = {
     "window_closed_minutes": 5,
     "skip_while": [OTHER],
     "idle_stop_minutes": 10,
+    "probe_every_minutes": 0,
+    "probe_minutes": 3,
+    "probe_fan": "low",
 }
 
 
@@ -107,7 +110,8 @@ def render(template, values=None, attrs=None, changed=None, now=NOW, **variables
 
 def decide(mode="off", room="23.0", setpoint=24.0, fan="auto", limit=22.0, master_on=True, in_hours=True,
            selected="on", owned="off", state=None, window="off", window_held=3600, unit_held=3600,
-           unit_updated=None, missing_window=False, other="off", room_vars=None, action="cooling", unit_reading=None, step=None, modes=("off", "cool", "heat", "fan_only")):
+           unit_updated=None, missing_window=False, other="off", room_vars=None, action="cooling", unit_reading=None, step=None, modes=("off", "cool", "heat", "fan_only"),
+           fan_modes=("auto", "low", "medium", "high")):
     room_vars = {**ROOM, **(room_vars or {})}
     values = {UNIT: mode, room_vars["room_switch"]: selected, room_vars["owned_flag"]: owned,
               room_vars["state_store"]: json.dumps(state or {}), OTHER: other}
@@ -122,7 +126,7 @@ def decide(mode="off", room="23.0", setpoint=24.0, fan="auto", limit=22.0, maste
         del values[OTHER]
     attrs = {UNIT: {"temperature": setpoint, "fan_mode": fan, "hvac_action": action,
                   "current_temperature": unit_reading,
-                  "target_temp_step": step, "hvac_modes": list(modes)}}
+                  "target_temp_step": step, "hvac_modes": list(modes), "fan_modes": list(fan_modes)}}
     # As in Home Assistant, the target is worked out first in the same variables block.
     step = float(render(STEP["step"], values, attrs, changed, limit_entity="input_number.limit", **room_vars))
     target = float(render(STEP["target"], values, attrs, changed, limit=limit, step=step, **room_vars))
@@ -247,7 +251,7 @@ def test_an_offline_unit_keeps_its_ownership_and_is_retried():
 def test_a_lost_state_store_turns_an_owned_unit_off_rather_than_leaving_it_on():
     # The owned flag is its own helper for exactly this case.
     assert decide(mode="cool", owned="on", room="25.0", setpoint=22.0, state={}) == "stop"
-    assert decide(mode="off", owned="on", room="25.0", state={}) == "stop"
+    assert decide(mode="off", owned="on", room="25.0", state={}) == "finish"
 
 
 def test_a_removed_window_sensor_blocks_the_start_without_raising():
@@ -414,7 +418,9 @@ def _walk(node):
 
 
 DECISIONS = ("start", "resend", "settle", "retarget", "stop", "restore_setpoint", "finish", "release",
-             "clear_release", "mark_over", "clear_over", "mark_idle", "clear_idle", "mark_change", "clear_change")
+             "clear_release", "mark_over", "clear_over", "mark_idle", "clear_idle", "mark_change", "clear_change",
+             "probe", "probe_running", "probe_resend", "probe_hot", "probe_cool_ok", "probe_restore", "probe_off",
+             "probe_finish", "probe_released", "probe_off_released", "restore_fan", "fan_restored")
 
 
 def test_every_decision_has_a_command_and_hold_does_nothing():
@@ -425,7 +431,7 @@ def test_every_decision_has_a_command_and_hold_does_nothing():
 
 def test_it_cools_and_can_never_heat():
     modes = {n["data"]["hvac_mode"] for n in _walk(CHOOSE) if isinstance(n.get("data"), dict) and "hvac_mode" in n["data"]}
-    assert modes == {"cool", "off"}
+    assert modes == {"cool", "off", "fan_only"}  # fan_only only to probe
 
 
 def test_a_start_acts_on_a_fresh_decision_with_no_delay_before_it():
@@ -507,3 +513,223 @@ def test_nothing_private_is_published():
         text = path.read_bytes().decode("utf-8", "ignore").lower()
         for word in set(re.findall(r"[a-z0-9]+", text)):
             assert hashlib.sha256(word.encode()).hexdigest()[:16] not in PRIVATE, path.name
+
+
+# -- probing: a room with no room reading -----------------------------------
+# Measured on a ducted unit: an idle unit's reading is off by up to 10 degrees either
+# way; on low fan it matched the room only after about 150 seconds. Commands are
+# sometimes dropped, and a fan setting sent to an off unit may switch it on.
+
+PROBE = {"room_sensor": "", "probe_every_minutes": 30}
+P_START = CLOCK - 400
+
+
+def probing(phase, **over):
+    state = {"phase": phase, "temperature": 22.0, "commanded_at": over.pop("at", CLOCK - 30),
+             "last_probe_at": over.pop("started", P_START)}
+    state.update(over)
+    return state
+
+
+ON = {"room_vars": PROBE, "owned": "on"}
+
+
+def test_a_room_with_no_reading_is_probed_every_so_often():
+    assert decide(room_vars=PROBE) == "probe"
+    assert decide(room_vars=PROBE, state={"last_probe_at": CLOCK - 1799}) == "hold"
+    assert decide(room_vars=PROBE, state={"last_probe_at": CLOCK - 1800}) == "probe"
+    assert decide(room_vars={**PROBE, "probe_every_minutes": 0}) == "hold"
+
+
+def test_a_room_whose_sensor_reports_is_never_probed():
+    assert decide(room="21.0", room_vars={"probe_every_minutes": 30}) == "hold"
+    assert decide(room="unavailable", room_vars={"probe_every_minutes": 30}) == "probe"
+
+
+@pytest.mark.parametrize("gate", [
+    {"master_on": False}, {"in_hours": False}, {"selected": "off"}, {"other": "on"}, {"window": "on"},
+    {"mode": "cool"}, {"modes": ("off", "cool")}, {"state": {"stopped_at": CLOCK - 60}},
+])
+def test_nothing_is_probed_when_a_gate_is_closed(gate):
+    assert decide(room_vars=PROBE, **gate) != "probe"
+
+
+def test_the_probe_never_sets_the_fan_on_an_off_unit():
+    # Fan only first; the quiet speed only once the unit is seen running.
+    start = _branch("probe")
+    assert not any(n.get("action") == "climate.set_fan_mode" for n in _walk(start))
+    assert not any(n.get("action") == "climate.set_fan_mode" for n in _walk(_branch("probe_resend")))
+    running = _branch("probe_running")
+    assert any(n.get("action") == "climate.set_fan_mode" for n in _walk(running))
+    saved = json.loads(render(running[0]["data"]["value"], attrs={UNIT: {"fan_mode": "high"}}, climate_entity=UNIT,
+                              saved=probing("probe"), stamp=CLOCK))
+    assert saved["fan"] == "high" and saved["on_at"] == CLOCK
+
+
+def test_a_probe_reads_only_at_the_end():
+    running = probing("probe", on_at=CLOCK - 179, fan="high")
+    assert decide(mode="fan_only", fan="low", unit_reading=30.0, state=running, **ON) == "hold"
+    done = probing("probe", on_at=CLOCK - 180, fan="high")
+    assert decide(mode="fan_only", fan="low", unit_reading=23.0, state=done, **ON) == "probe_hot"
+    assert decide(mode="fan_only", fan="low", unit_reading=22.0, state=done, **ON) == "probe_restore"
+    assert decide(mode="fan_only", fan="low", unit_reading=None, state=done, **ON) == "probe_restore"
+    assert decide(mode="fan_only", state=probing("probe"), **ON) == "probe_running"
+
+
+def test_a_dropped_probe_start_is_resent_then_made_sure_off():
+    assert decide(mode="off", state=probing("probe", at=CLOCK - 30, started=CLOCK - 30), **ON) == "hold"
+    assert decide(mode="off", state=probing("probe", at=CLOCK - 60, started=CLOCK - 120), **ON) == "probe_resend"
+    # Gave up: send off, so a late fan-only does not run on unowned.
+    assert decide(mode="off", state=probing("probe", at=CLOCK - 60, started=CLOCK - 300), **ON) == "probe_off"
+
+
+def test_an_off_reading_during_a_probe_is_judged_before_it_counts():
+    state = probing("probe", on_at=CLOCK - 60, at=CLOCK - 90, started=CLOCK - 90, fan="high")
+    assert decide(mode="off", unit_held=60, state=state, **ON) == "hold"
+    assert decide(mode="off", unit_held=120, state=state, **ON) == "probe_released"
+    restoring = probing("probe_restore", fan="high", fan_sent=CLOCK - 30)
+    assert decide(mode="off", unit_held=60, state=restoring, **ON) == "hold"
+    assert decide(mode="off", unit_held=120, state=restoring, **ON) == "probe_released"
+
+
+def test_a_person_turning_a_probe_into_something_else_gets_it():
+    state = probing("probe", on_at=CLOCK - 60, fan="high")
+    assert decide(mode="cool", unit_held=60, state=state, **ON) == "release"
+    assert decide(mode="heat", unit_held=30, state=state, **ON) == "hold"
+
+
+def test_a_probe_ends_early_when_the_night_or_a_window_says_so():
+    state = probing("probe", on_at=CLOCK - 60, fan="high")
+    assert decide(mode="fan_only", in_hours=False, state=state, **ON) == "probe_restore"
+    assert decide(mode="fan_only", window="on", window_held=120, state=state, **ON) == "probe_restore"
+
+
+def test_the_fan_goes_back_while_running_for_at_most_three_minutes_then_off():
+    common = {"mode": "fan_only", **ON}
+    assert decide(fan="low", state=probing("probe_restore", fan="high", fan_sent=CLOCK - 30, at=CLOCK - 30), **common) == "hold"
+    assert decide(fan="low", state=probing("probe_restore", fan="high", fan_sent=CLOCK - 60, at=CLOCK - 60), **common) == "probe_restore"
+    assert decide(fan="high", state=probing("probe_restore", fan="high", fan_sent=CLOCK - 30), **common) == "probe_off"
+    assert decide(fan="low", state=probing("probe_restore", fan="high", fan_sent=CLOCK - 180, at=CLOCK - 60), **common) == "probe_off"
+    # A saved fan the unit does not offer is not chased.
+    assert decide(fan="low", state=probing("probe_restore", fan="Turbo", fan_sent=CLOCK - 30), **common) == "probe_off"
+    assert decide(fan="high", state=probing("probe_stopping", at=CLOCK - 59), **common) == "hold"
+    assert decide(fan="high", state=probing("probe_stopping", at=CLOCK - 60), **common) == "probe_off"
+    assert decide(mode="off", state=probing("probe_stopping"), **ON) == "probe_finish"
+
+
+def test_a_hot_probe_keeps_its_phase_until_cool_is_confirmed():
+    hot = probing("probe_cool", on_at=CLOCK - 300, hot_at=CLOCK - 30, fan="high", expected=22.0, at=CLOCK - 30)
+    assert decide(mode="fan_only", fan="low", state=hot, unit_held=400, **ON) == "hold"  # not released
+    assert decide(mode="fan_only", fan="low", state=dict(hot, commanded_at=CLOCK - 60), unit_held=400, **ON) == "probe_hot"
+    assert decide(mode="fan_only", fan="low", state=dict(hot, hot_at=CLOCK - 300, commanded_at=CLOCK - 60), unit_held=400, **ON) == "probe_restore"
+    assert decide(mode="cool", fan="low", state=hot, **ON) == "probe_cool_ok"
+    ok = json.loads(render(_branch("probe_cool_ok")[0]["data"]["value"], saved=hot))
+    assert "phase" not in ok and ok["fan"] == "high" and ok["expected"] == 22.0 and ok["settled"] is False
+
+
+def test_after_a_hot_probe_the_fan_goes_back_before_the_unit_stops_even_if_the_command_is_dropped():
+    run = dict(RUNNING, running_fan="low", fan="high")
+    base = {"mode": "cool", "setpoint": 22.0, "owned": "on", "unit_held": 600, "fan": "low", "room_vars": PROBE}
+    assert decide(in_hours=False, state=run, **base) == "restore_fan"
+    # Dropped: still low, still inside the window, so resend; not a person's change.
+    assert decide(in_hours=False, state=dict(run, fan_sent=CLOCK - 60), **base) == "restore_fan"
+    assert decide(in_hours=False, state=dict(run, fan_sent=CLOCK - 180), **base) == "stop"
+    # Landed: high differs from running_fan, but it is ours, not a person's.
+    assert decide(in_hours=False, state=dict(run, fan_sent=CLOCK - 30), **{**base, "fan": "high"}) == "fan_restored"
+    assert decide(in_hours=False, state=dict(run, running_fan="high", fan_sent=0), **{**base, "fan": "high"}) == "stop"
+    idle = dict(run, idle_since=CLOCK - 600)
+    assert decide(action="idle", state=idle, **base) == "restore_fan"
+    unsettled = dict(run, settled=False, commanded_at=CLOCK - 30)
+    assert decide(in_hours=False, state=unsettled, **base) == "restore_fan"
+
+
+def test_a_lost_state_store_stops_a_unit_it_could_have_started_and_keeps_stopping_it():
+    assert decide(mode="fan_only", owned="on", room="25.0", state={}, unit_held=600) == "stop"
+    # The off was dropped: resend, never hand it back running.
+    lost = {"stopping": True, "commanded_at": CLOCK - 30}
+    assert decide(mode="fan_only", owned="on", room="25.0", state=lost, unit_held=600) == "hold"
+    assert decide(mode="fan_only", owned="on", room="25.0", state=dict(lost, commanded_at=CLOCK - 120), unit_held=600) == "stop"
+    assert decide(mode="off", owned="on", room="25.0", state=lost) == "finish"
+    # It never sets heat or dry, so those are a person's.
+    assert decide(mode="heat", owned="on", room="25.0", state={}, unit_held=60) == "release"
+
+
+def test_the_fan_is_never_restored_on_an_off_unit():
+    run = dict(RUNNING, running_fan="low", fan="high", settled=False, commanded_at=CLOCK - 30)
+    base = {"setpoint": 22.0, "owned": "on", "unit_held": 600, "fan": "low", "room_vars": PROBE}
+    assert decide(mode="off", in_hours=False, state=run, **base) == "stop"
+
+
+def test_a_late_cool_after_the_probe_gave_up_is_ours_and_switched_off():
+    for phase in ("probe_restore", "probe_stopping"):
+        state = probing(phase, hot_at=CLOCK - 400, fan="high", fan_sent=CLOCK - 30)
+        assert decide(mode="cool", unit_held=60, state=state, **ON) == "probe_off"
+    # Off after a hot probe is made sure, so a late cool cannot run on unowned.
+    hot = probing("probe_cool", on_at=CLOCK - 300, hot_at=CLOCK - 200, fan="high", expected=22.0)
+    assert decide(mode="off", unit_held=120, state=hot, **ON) == "probe_off_released"
+
+
+def test_nothing_new_starts_once_the_night_is_over():
+    hot = probing("probe_cool", on_at=CLOCK - 300, hot_at=CLOCK - 30, fan="high", expected=22.0, at=CLOCK - 60)
+    assert decide(mode="fan_only", fan="low", in_hours=False, unit_held=400, state=hot, **ON) == "probe_restore"
+    unstarted = probing("probe", at=CLOCK - 60, started=CLOCK - 60)
+    assert decide(mode="off", master_on=False, state=unstarted, **ON) == "probe_off"
+
+
+def test_once_the_fan_is_back_a_persons_fan_change_counts_again():
+    landed = dict(RUNNING, running_fan="low", fan="high", fan_sent=CLOCK - 30)
+    base = {"mode": "cool", "setpoint": 22.0, "owned": "on", "unit_held": 600, "room": "25.0", "room_vars": PROBE}
+    assert decide(fan="high", state=landed, **base) == "fan_restored"
+    restored = json.loads(render(_branch("fan_restored")[0]["data"]["value"], saved=landed))
+    assert restored["running_fan"] == "high" and not restored["fan_sent"]
+
+
+def test_a_person_switching_a_probe_off_silences_the_room_for_the_night():
+    state = probing("probe", on_at=CLOCK - 60, at=CLOCK - 90, started=CLOCK - 90, fan="high")
+    assert decide(mode="off", unit_held=120, state=state, **ON) == "probe_released"
+    released = json.loads(render(_branch("probe_released")[1]["data"]["value"], saved=state))
+    assert released == {"released": True, "last_probe_at": CLOCK - 90}
+    assert decide(room_vars=PROBE, state=released) == "hold"
+
+
+
+def test_restore_fan_never_rewrites_the_baseline():
+    value = _branch("restore_fan")[0]["data"]["value"]
+    saved = json.loads(render(value, saved=dict(RUNNING, running_fan="low", fan="high"), stamp=CLOCK))
+    assert saved["running_fan"] == "low" and saved["fan_sent"] == CLOCK
+
+
+def test_probe_finish_keeps_the_probe_time_and_clear_over_keeps_it_too():
+    finish = json.loads(render(_branch("probe_finish")[1]["data"]["value"], saved=probing("probe_stopping")))
+    assert finish == {"last_probe_at": P_START}
+    cleared = json.loads(render(_branch("clear_over")[0]["data"]["value"], saved={"over_since": 1, "last_probe_at": 5}))
+    assert cleared == {"last_probe_at": 5}
+
+
+def test_the_longest_reachable_state_fits_the_state_store():
+    # Home Assistant's to_json is compact, and stamps are whole seconds.
+    longest = {"temperature": 29.5, "fan": "medium-high", "expected": 26.5, "commanded_at": 4102444800,
+               "settled": True, "last_probe_at": 4102444800, "running_fan": "medium-high", "fan_sent": 4102444800,
+               "idle_since": 4102444800, "changed_since": 4102444800, "stopping": True}
+    assert len(json.dumps(longest, separators=(",", ":"))) < 255
+    probe = {"phase": "probe_restore", "temperature": 29.5, "commanded_at": 4102444800, "last_probe_at": 4102444800,
+             "on_at": 4102444800, "fan": "medium-high", "hot_at": 4102444800, "expected": 26.5, "settled": False,
+             "fan_sent": 4102444800}
+    assert len(json.dumps(probe, separators=(",", ":"))) < 255
+
+
+def test_a_fan_restore_that_never_landed_does_not_hide_a_persons_fan_change_later():
+    stale = dict(RUNNING, running_fan="low", fan="high", fan_sent=CLOCK - 600)
+    base = {"mode": "cool", "setpoint": 22.0, "owned": "on", "unit_held": 600, "room": "25.0", "room_vars": PROBE}
+    assert decide(fan="medium", state=stale, **base) == "mark_change"
+    # And a cleared stamp (0) does not reopen the restore window.
+    assert decide(fan="low", in_hours=False, state=dict(stale, fan_sent=0), **base) == "stop"
+
+
+def test_a_person_switching_off_the_cooling_part_of_a_probe_silences_the_room_too():
+    hot = probing("probe_cool", on_at=CLOCK - 300, hot_at=CLOCK - 200, fan="high", expected=22.0)
+    assert decide(mode="off", unit_held=120, state=hot, **ON) == "probe_off_released"
+    stopping = json.loads(render(_branch("probe_off_released")[0]["data"]["value"], saved=hot, stamp=CLOCK))
+    assert stopping["phase"] == "probe_stopping" and stopping["release_after"] is True
+    done = json.loads(render(_branch("probe_finish")[1]["data"]["value"], saved=dict(stopping)))
+    assert done == {"released": True, "last_probe_at": P_START}
