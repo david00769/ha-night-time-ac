@@ -1,0 +1,28 @@
+# A vertical stack: master tile, settings, one switch per room, and a status line.
+type: vertical-stack
+cards:
+  - type: tile
+    entity: input_boolean.night_ac
+    name: Night time AC
+    icon: mdi:weather-night
+    tap_action:
+      action: toggle
+  - type: entities
+    entities:
+      - entity: input_number.night_ac_limit
+        name: Cool when above
+      - entity: input_datetime.night_ac_start
+        name: Start
+      - entity: input_datetime.night_ac_end
+        name: End
+      - type: section
+        label: Rooms
+      - entity: input_boolean.night_ac_bedroom
+        name: Bedroom
+  - type: markdown
+    content: >-
+      {% set owned = is_state('input_boolean.night_ac_bedroom_owned', 'on') %}
+      {% set s = states('input_text.night_ac_bedroom_state') | from_json({}) %}
+      **Bedroom:** {{ 'cooling' if owned else ('left alone tonight' if s.released else 'idle') }}
+
+      *{{ states('input_text.night_ac_last_action') }}*

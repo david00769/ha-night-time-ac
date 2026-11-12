@@ -1,0 +1,579 @@
+blueprint:
+  name: Night time AC
+  description: >-
+    Keeps one room at or below a temperature limit during set hours. If the room
+    goes over the limit, its air conditioner cools it back to the limit and then
+    returns to off with its earlier setpoint. A unit that someone else turned on
+    is never touched, whatever its setting, and a manual change to a unit this
+    automation started hands it back for the rest of the night. Create one
+    automation per room.
+
+    Needs, per room: an on/off switch (input_boolean), an "owned" flag
+    (input_boolean) and a state store (input_text with maximum length 255). Shared
+    by all rooms: a master switch (input_boolean), the limit (input_number) and
+    the start and end times (input_datetime, time only). See the README.
+  domain: automation
+  author: david00769
+  source_url: https://github.com/david00769/ha-night-time-ac/blob/main/blueprints/automation/david00769/night_time_ac.yaml
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    room:
+      name: Room
+      input:
+        climate:
+          name: Air conditioner
+          selector:
+            entity:
+              filter:
+                domain: climate
+        room_temperature:
+          name: Room temperature sensor
+          description: >-
+            A sensor in the room. The air conditioner's own reading is not used:
+            an idle ducted unit can read far below the room. Leave empty and the
+            room never starts.
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: temperature
+        windows:
+          name: Windows and doors
+          description: >-
+            Contacts that are on when open. The room starts only when all have been
+            closed for a while, and a running unit stops when one stays open.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: binary_sensor
+    helpers:
+      name: Helpers
+      input:
+        room_switch:
+          name: This room's switch
+          description: An input_boolean that turns this room on or off.
+          selector:
+            entity:
+              filter:
+                domain: input_boolean
+        owned:
+          name: This room's owned flag
+          description: >-
+            An input_boolean only this automation uses. On while it is running the
+            unit, so a lost state store still turns the unit off rather than
+            leaving it on all night.
+          selector:
+            entity:
+              filter:
+                domain: input_boolean
+        state:
+          name: This room's state store
+          description: An input_text only this automation uses. Set its maximum length to 255.
+          selector:
+            entity:
+              filter:
+                domain: input_text
+        master_switch:
+          name: Master switch
+          description: Shared by every room.
+          selector:
+            entity:
+              filter:
+                domain: input_boolean
+        limit:
+          name: Temperature limit
+          description: An input_number, in Home Assistant's temperature unit. Shared by every room.
+          selector:
+            entity:
+              filter:
+                domain: input_number
+        start_time:
+          name: Start time
+          description: An input_datetime with time only. Shared by every room.
+          selector:
+            entity:
+              filter:
+                domain: input_datetime
+        end_time:
+          name: End time
+          description: An input_datetime with time only. Equal start and end mean no hours at all.
+          selector:
+            entity:
+              filter:
+                domain: input_datetime
+    tuning:
+      name: Tuning and integration
+      collapsed: true
+      input:
+        margin:
+          name: Margin above the limit before starting
+          description: Keeps it from starting and stopping around the limit, so not below 0.2.
+          default: 0.5
+          selector:
+            number:
+              min: 0.2
+              max: 3
+              step: 0.1
+        hold_minutes:
+          name: Minutes over the limit before starting
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 30
+              unit_of_measurement: min
+        cooldown_minutes:
+          name: Minutes off before starting again
+          default: 15
+          selector:
+            number:
+              min: 0
+              max: 60
+              unit_of_measurement: min
+        idle_stop_minutes:
+          name: Minutes idle before switching a running unit off
+          description: >-
+            Many units keep their fan running once they reach the setpoint. When a
+            unit this automation started has stopped cooling (it reports idle or fan,
+            or its own reading is at or below its setpoint) for this long, it is
+            switched off, so the room is quiet. If the room warms
+            again it starts again. 0 keeps it running until the room or the night ends.
+          default: 10
+          selector:
+            number:
+              min: 0
+              max: 60
+              unit_of_measurement: min
+        window_open_minutes:
+          name: Minutes a window stays open before a running unit stops
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 30
+              unit_of_measurement: min
+        window_closed_minutes:
+          name: Minutes every window must be closed before starting
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 30
+              unit_of_measurement: min
+        check_second:
+          name: Second of each minute to check
+          description: >-
+            Give rooms on one outdoor unit different seconds (for example 0, 20 and
+            40) so they do not start together.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 59
+              unit_of_measurement: s
+        skip_while:
+          name: Leave alone while
+          description: >-
+            Entities that must all be off for this room to start, such as another
+            automation's flag for the same unit. Anything else, including
+            unavailable, blocks a start. A running unit is not stopped by them.
+          default: []
+          selector:
+            entity:
+              multiple: true
+        last_action:
+          name: Last action text (optional)
+          description: An input_text that receives a short note of each start and stop.
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: input_text
+        battery_level:
+          name: Battery level sensor (optional, for the log)
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: sensor
+        grid_power:
+          name: Grid power sensor (optional, for the log)
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: sensor
+
+mode: single
+max_exceeded: silent
+
+variables:
+  climate_entity: !input climate
+  room_sensor: !input room_temperature
+  windows_input: !input windows
+  windows: "{{ [windows_input] if windows_input is string and windows_input else (windows_input or []) }}"
+  room_switch: !input room_switch
+  owned_flag: !input owned
+  state_store: !input state
+  master_switch: !input master_switch
+  limit_entity: !input limit
+  start_entity: !input start_time
+  end_entity: !input end_time
+  margin: !input margin
+  hold_minutes: !input hold_minutes
+  cooldown_minutes: !input cooldown_minutes
+  idle_stop_minutes: !input idle_stop_minutes
+  window_open_minutes: !input window_open_minutes
+  window_closed_minutes: !input window_closed_minutes
+  skip_input: !input skip_while
+  skip_while: "{{ [skip_input] if skip_input is string and skip_input else (skip_input or []) }}"
+  last_action: !input last_action
+  battery_level: !input battery_level
+  grid_power: !input grid_power
+  room_name: "{{ state_attr(climate_entity, 'friendly_name') or climate_entity }}"
+
+triggers:
+  - trigger: time_pattern
+    minutes: "/1"
+    seconds: !input check_second
+  - trigger: state
+    entity_id:
+      - !input master_switch
+      - !input room_switch
+      - !input limit
+
+conditions:
+  # Until every helper has loaded, "off" cannot be told from "not loaded yet", and a
+  # restart must not put back a unit that is meant to be cooling.
+  - condition: template
+    value_template: >-
+      {{ states(master_switch) in ['on', 'off'] and states(owned_flag) in ['on', 'off'] and
+         states(room_switch) in ['on', 'off'] and is_number(states(limit_entity)) and
+         ':' in states(start_entity) and ':' in states(end_entity) and
+         states(state_store) not in ['unknown', 'unavailable'] and
+         state_attr(state_store, 'max') | int(0) >= 255 }}
+
+actions:
+  - variables:
+      limit: "{{ states(limit_entity) | float }}"
+      master_on: "{{ is_state(master_switch, 'on') }}"
+      # What is sent: the limit rounded to the unit's own step and kept in its range, so the
+      # unit reports back what it was sent and nothing is resent all night.
+      # Rounded down, so the unit is never asked to stop short of the limit. A unit that
+      # reports no step is taken as 0.5 degree, or whole degrees in Fahrenheit.
+      step: >-
+        {%- set st = state_attr(climate_entity, 'target_temp_step') | float(0) -%}
+        {{ st if st > 0 else (1.0 if state_attr(limit_entity, 'unit_of_measurement') in ['°F', 'F'] else 0.5) }}
+      target: >-
+        {%- set lo = state_attr(climate_entity, 'min_temp') | float(-1000) -%}
+        {%- set hi = state_attr(climate_entity, 'max_temp') | float(1000) -%}
+        {{ ([[((limit / step + 0.000001) | round(0, 'floor')) * step, lo] | max, hi] | min) | round(3) | float }}
+      in_hours: >-
+        {% set start = states(start_entity)[:5] %}
+        {% set end = states(end_entity)[:5] %}
+        {% set clock = now().strftime('%H:%M') %}
+        {{ (clock >= start or clock < end) if start > end else (start <= clock and clock < end) }}
+      decision: >-
+        {%- set s = states(state_store) | from_json({}) -%}
+        {%- set s = s if s is mapping else {} -%}
+        {%- set mode = states(climate_entity) -%}
+        {%- set clock = now().timestamp() -%}
+        {%- set room = states(room_sensor) | float(none) if room_sensor else none -%}
+        {%- set selected = is_state(room_switch, 'on') -%}
+        {%- set allowed = master_on and selected and in_hours -%}
+        {#- Setpoints match within half the unit's step: units round, and so do unit systems. -#}
+        {%- set tol = step / 2 + 0.01 -%}
+        {%- set held = (now() - states[climate_entity].last_changed).total_seconds() if states[climate_entity] is not none else 0 -%}
+        {%- set ns = namespace(held_open=false, not_settled_closed=false) -%}
+        {%- for window in windows -%}
+          {#- A removed sensor reads as None here; it blocks a start and must not raise. -#}
+          {%- set contact = states[window] -%}
+          {%- set held = (now() - contact.last_changed).total_seconds() if contact is not none else 0 -%}
+          {%- if is_state(window, 'on') and held >= window_open_minutes * 60 %}{% set ns.held_open = true %}{% endif -%}
+          {%- if not is_state(window, 'off') or held < window_closed_minutes * 60 %}{% set ns.not_settled_closed = true %}{% endif -%}
+        {%- endfor -%}
+        {%- if is_state(owned_flag, 'on') -%}
+          {%- set age = clock - (s.get('commanded_at') or 0) -%}
+          {%- set wants_stop = not allowed or ns.held_open or (room is not none and room <= limit) -%}
+          {%- set setpoint = state_attr(climate_entity, 'temperature') | float(-999) -%}
+          {%- set fan = state_attr(climate_entity, 'fan_mode') -%}
+          {%- if mode in ['unknown', 'unavailable', 'none', ''] -%}
+            hold
+          {%- elif mode not in ['cool', 'off'] -%}
+            {#- This automation only ever sets cool, so another mode held a minute is a person's
+                choice; a passing one while the unit changes state is not. -#}
+            {{ 'release' if held >= 60 else 'hold' }}
+          {%- elif s.get('stopping') -%}
+            {%- if mode != 'off' -%}
+              {{ 'stop' if age >= 120 else 'hold' }}
+            {%- elif s.get('temperature') is not none and setpoint != -999 and
+                     (setpoint - s.get('temperature') | float(-1)) | abs >= tol and age < 600 -%}
+              restore_setpoint
+            {%- else -%}
+              finish
+            {%- endif -%}
+          {%- elif s.get('expected') is none -%}
+            {#- The saved state is gone: there is nothing to run to, so never command it on. -#}
+            stop
+          {%- elif not s.get('settled') -%}
+            {{ 'stop' if wants_stop else
+               ('settle' if mode == 'cool' and (setpoint - s.get('expected') | float(-1)) | abs < tol else
+                ('resend' if age >= 120 else 'hold')) }}
+          {%- elif mode == 'off' -%}
+            {#- Off could be one bad reading or a person: judge it for three minutes and do
+                nothing meanwhile, so a person's off becomes a release and not a stop. -#}
+            {{ 'release' if held >= 180 else 'hold' }}
+          {%- elif (setpoint != -999 and (setpoint - s.get('expected') | float(-1)) | abs >= tol) or
+                   (fan not in [none, '', 'unknown', 'unavailable'] and s.get('running_fan') is not none and fan != s.get('running_fan')) -%}
+            {#- A missing reading is not a change. A differing one must hold 90 seconds from when
+                it was first seen; nothing else is decided meanwhile, so a person's change is not undone. -#}
+            {%- if not s.get('changed_since') -%}
+              mark_change
+            {%- elif clock - s.get('changed_since') >= 90 -%}
+              release
+            {%- else -%}
+              hold
+            {%- endif -%}
+          {%- elif wants_stop -%}
+            stop
+          {%- elif s.get('changed_since') -%}
+            clear_change
+          {%- elif (s.get('expected') | float(-1) - target) | abs >= tol -%}
+            retarget
+          {%- else -%}
+            {#- A unit at its setpoint often keeps its fan on. Idle long enough, it goes off.
+                Idle: it says so, or its own reading has reached its setpoint (its thermostat is
+                satisfied), for units that never report idle. With the fan running, the unit's
+                reading follows the room. -#}
+            {%- set reading = state_attr(climate_entity, 'current_temperature') | float(none) -%}
+            {%- set idle = idle_stop_minutes > 0 and
+                (state_attr(climate_entity, 'hvac_action') in ['idle', 'fan'] or
+                 (reading is not none and setpoint != -999 and reading <= setpoint)) -%}
+            {%- if idle and not s.get('idle_since') -%}
+              mark_idle
+            {%- elif idle and clock - s.get('idle_since') >= idle_stop_minutes * 60 -%}
+              stop
+            {%- elif not idle and s.get('idle_since') -%}
+              clear_idle
+            {%- else -%}
+              hold
+            {%- endif -%}
+          {%- endif -%}
+        {%- elif s.get('released') -%}
+          {{ 'clear_release' if not in_hours or not selected else 'hold' }}
+        {%- else -%}
+          {%- set cooled_down = clock - (s.get('stopped_at') or 0) >= cooldown_minutes * 60 -%}
+          {%- set others_clear = skip_while | reject('is_state', 'off') | list | count == 0 -%}
+          {%- set can_cool = 'cool' in (state_attr(climate_entity, 'hvac_modes') or []) -%}
+          {%- set can_start = allowed and mode == 'off' and can_cool and others_clear and cooled_down and
+              not ns.not_settled_closed and room is not none and room >= limit + margin -%}
+          {%- if can_start -%}
+            {{ 'mark_over' if not s.get('over_since') else
+               ('start' if clock - s.get('over_since') >= hold_minutes * 60 else 'hold') }}
+          {%- else -%}
+            {{ 'clear_over' if s.get('over_since') else 'hold' }}
+          {%- endif -%}
+        {%- endif -%}
+      saved: "{{ (states(state_store) | from_json({})) if (states(state_store) | from_json({})) is mapping else {} }}"
+      stamp: "{{ now().timestamp() | round(0) }}"
+      energy: >-
+        {%- set parts = [] -%}
+        {%- if battery_level %}{% set parts = parts + ['battery ' ~ states(battery_level) ~ '%'] %}{% endif -%}
+        {%- if grid_power %}{% set parts = parts + ['grid ' ~ states(grid_power) ~ ' W'] %}{% endif -%}
+        {{ (' (' ~ parts | join(', ') ~ ')') if parts else '' }}
+  - condition: template
+    value_template: "{{ decision != 'hold' }}"
+  - choose:
+      - conditions: "{{ decision == 'start' }}"
+        sequence:
+          # Save first, so a failure part-way can still be put back.
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: >-
+                {{ {'temperature': state_attr(climate_entity, 'temperature'), 'expected': target,
+                    'commanded_at': stamp, 'settled': false} | to_json }}
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ owned_flag }}"
+          # cool, never heat_cool, so this can never heat a room.
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: cool
+          - action: climate.set_temperature
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              temperature: "{{ target }}"
+          - action: logbook.log
+            data:
+              name: Night time AC
+              entity_id: "{{ climate_entity }}"
+              message: "{{ room_name }} over the limit: cooling to {{ target }}{{ energy }}."
+          - if: "{{ last_action != '' }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ last_action }}"
+                data:
+                  value: "{{ room_name }} over the limit: cooling to {{ target }}{{ energy }}."
+      - conditions: "{{ decision == 'resend' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, commanded_at=stamp) | to_json }}"
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: cool
+          - action: climate.set_temperature
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              temperature: "{{ saved.get('expected') }}"
+      - conditions: "{{ decision == 'settle' }}"
+        sequence:
+          # The fan baseline is read now: a unit that is off may report it differently.
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, settled=true, running_fan=state_attr(climate_entity, 'fan_mode')) | to_json }}"
+      - conditions: "{{ decision == 'retarget' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, expected=target, commanded_at=stamp, settled=false) | to_json }}"
+          - action: climate.set_temperature
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              temperature: "{{ target }}"
+      - conditions: "{{ decision == 'stop' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, stopping=true, commanded_at=stamp) | to_json }}"
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              hvac_mode: "off"
+      # After off: a setpoint sent just before off was lost on a real unit, while one
+      # sent to an off unit landed within seconds and left it off. The fan needs no
+      # restoring because this automation never changes it.
+      - conditions: "{{ decision == 'restore_setpoint' }}"
+        sequence:
+          - action: climate.set_temperature
+            target:
+              entity_id: "{{ climate_entity }}"
+            data:
+              temperature: "{{ saved.get('temperature') }}"
+      - conditions: "{{ decision == 'finish' }}"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ owned_flag }}"
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ {'stopped_at': stamp} | to_json }}"
+          - action: logbook.log
+            data:
+              name: Night time AC
+              entity_id: "{{ climate_entity }}"
+              message: "{{ room_name }} returned to off{{ energy }}."
+          - if: "{{ last_action != '' }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ last_action }}"
+                data:
+                  value: "{{ room_name }} returned to off{{ energy }}."
+      - conditions: "{{ decision == 'release' }}"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ owned_flag }}"
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: '{"released": true}'
+          - action: logbook.log
+            data:
+              name: Night time AC
+              entity_id: "{{ climate_entity }}"
+              message: "{{ room_name }} changed by someone ({{ states(climate_entity) }}); left alone until the next night."
+          - if: "{{ last_action != '' }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ last_action }}"
+                data:
+                  value: "{{ room_name }} changed by someone: left alone until the next night."
+      - conditions: "{{ decision == 'clear_release' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{}"
+      - conditions: "{{ decision == 'mark_over' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, over_since=stamp) | to_json }}"
+      - conditions: "{{ decision == 'mark_change' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, changed_since=stamp) | to_json }}"
+      - conditions: "{{ decision == 'clear_change' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, changed_since=0) | to_json }}"
+      - conditions: "{{ decision == 'mark_idle' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, idle_since=stamp) | to_json }}"
+      - conditions: "{{ decision == 'clear_idle' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: "{{ dict(saved, idle_since=0) | to_json }}"
+      - conditions: "{{ decision == 'clear_over' }}"
+        sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ state_store }}"
+            data:
+              value: >-
+                {{ ({'stopped_at': saved.get('stopped_at')} if saved.get('stopped_at') else {}) | to_json }}

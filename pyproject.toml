@@ -1,0 +1,12 @@
+[project]
+name = "ha-night-time-ac"
+version = "1.0.0"
+description = "Home Assistant blueprint: keep a room under a temperature limit at night, and put the air conditioner back as it was."
+requires-python = ">=3.12"
+license = "MIT"
+
+[dependency-groups]
+dev = ["pytest>=8", "pyyaml>=6", "jinja2>=3.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

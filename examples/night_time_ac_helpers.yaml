@@ -1,0 +1,41 @@
+# Night time AC helpers: a package. Copy to /config/packages/night_time_ac.yaml.
+# Shared by all rooms, then three helpers per room (repeat for each room).
+
+input_boolean:
+  night_ac:
+    name: Night time AC
+    icon: mdi:weather-night
+  night_ac_bedroom:
+    name: Night time AC - Bedroom
+    icon: mdi:bed
+  night_ac_bedroom_owned:
+    name: Night time AC - Bedroom owned
+    icon: mdi:robot-outline
+
+input_number:
+  night_ac_limit:
+    name: Night time AC limit
+    icon: mdi:thermometer
+    min: 18                 # Fahrenheit systems: 64
+    max: 28                 # 82
+    step: 0.5               # 1
+    unit_of_measurement: °C # °F
+    mode: slider
+
+input_datetime:
+  night_ac_start:
+    name: Night time AC start
+    has_date: false
+    has_time: true
+  night_ac_end:
+    name: Night time AC end
+    has_date: false
+    has_time: true
+
+input_text:
+  night_ac_last_action:
+    name: Night time AC last action
+    max: 255
+  night_ac_bedroom_state:
+    name: Night time AC - Bedroom state
+    max: 255
